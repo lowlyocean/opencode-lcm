@@ -9,7 +9,7 @@ import { runBinaryPreviewProviders } from '../dist/preview-providers.js';
 
 type PreviewContext = Parameters<typeof runBinaryPreviewProviders>[0];
 type FilePart = PreviewContext['file'];
-type FileSource = Extract<NonNullable<FilePart['source']>, { type: 'file' }>;
+type FileSource = NonNullable<FilePart['source']>;
 
 function makeWorkspace(prefix: string): string {
   return mkdtempSync(path.join(tmpdir(), `${prefix}-`));
@@ -35,6 +35,8 @@ function makeFilePart(filePath: string): FilePart {
     sessionID: 'session-1',
     messageID: 'message-1',
     type: 'file',
+    state: { output: '', error: '' },
+    files: [],
     mime: 'application/octet-stream',
     filename: path.basename(filePath),
     url: pathToFileURL(filePath).href,
