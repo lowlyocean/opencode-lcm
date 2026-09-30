@@ -1,21 +1,9 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import test from 'node:test';
-
 import OpencodeLcmPlugin from '../dist/index.js';
-import { getLogger, setLogger } from '../dist/logging.js';
 import { DEFAULT_OPTIONS, resolveOptions } from '../dist/options.js';
-
-import {
-  captureMessage,
-  conversationMessage,
-  makeOptions,
-  makePluginContext,
-  makeToolContext,
-  makeWorkspace,
-  sessionInfo,
-  textPart,
-  toolCompletedPart,
-} from './helpers.mjs';
+import { modelContext, pluginHarness, textMessage } from './v2-helpers.mjs';
 
 const ALLOW_UNSAFE_BUN_WINDOWS_ENV = 'OPENCODE_LCM_ALLOW_UNSAFE_BUN_WINDOWS';
 
@@ -146,435 +134,84 @@ test('resolveOptions normalizes malformed plugin config', () => {
   });
 });
 
-test('plugin uses Node sidecar on Bun Windows without unsafe env override', async () => {
-  const workspace = makeWorkspace('lcm-plugin-bun-win-sidecar');
-
-  try {
+for (const [label, config, env, backend] of [
+  ['default safety', false, false, 'node_sidecar'],
+  ['config cannot bypass safety', true, false, 'node_sidecar'],
+  ['explicit environment override', false, true, 'in_process'],
+]) {
+  test(`Bun Windows: ${label}`, async (t) => {
     await withSimulatedBunWindows(async () => {
-      const hooks = await OpencodeLcmPlugin(
-        makePluginContext(workspace),
-        makeOptions({ freshTailMessages: 1 }),
-      );
-
-      assert.ok(hooks.tool.lcm_describe);
-
-      await hooks.event({
-        event: {
-          type: 'session.created',
-          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
-        },
-      });
-      await captureMessage(
-        { capture: (event) => hooks.event({ event }) },
-        {
-          sessionID: 's1',
-          messageID: 'm1',
-          created: 2,
-          parts: [textPart('s1', 'm1', 'm1-p', 'sidecar preserved core functionality')],
-        },
-      );
-
-      const systemOutput = { system: [] };
-      await hooks['experimental.chat.system.transform'](
-        { sessionID: 's1', model: {} },
-        systemOutput,
-      );
-      assert.equal(systemOutput.system.length, 1);
-      assert.match(systemOutput.system[0], /Archived session state/);
-
-      const messagesOutput = {
-        messages: [
-          conversationMessage({
-            sessionID: 's1',
-            messageID: 'm1',
-            created: 1,
-            parts: [textPart('s1', 'm1', 'm1-p1', 'safe mode leaves messages untouched')],
-          }),
-        ],
-      };
-      await hooks['experimental.chat.messages.transform']({}, messagesOutput);
-      assert.equal(messagesOutput.messages[0].parts[0].text, 'safe mode leaves messages untouched');
-
-      const compactionOutput = { context: [], prompt: 'keep-default' };
-      await hooks['experimental.session.compacting']({ sessionID: 's1' }, compactionOutput);
-      assert.equal(compactionOutput.context.length, 1);
-
-      const toolContext = makeToolContext(workspace, 's1');
-      const status = await hooks.tool.lcm_status.execute({}, toolContext);
-      const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
-
-      assert.match(status, /schema_version=2/);
-      assert.match(status, /runtime_safety_allow_unsafe_bun_windows=false/);
-      assert.match(status, /runtime_safety_config_allow_unsafe_bun_windows=false/);
-      assert.match(status, /runtime_safety_env_allow_unsafe_bun_windows=false/);
-      assert.match(status, /runtime_safety_backend=node_sidecar/);
-      assert.match(describe, /sidecar preserved core functionality/);
+      if (env) process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV] = '1';
+      const h = await pluginHarness(t, { runtimeSafety: { allowUnsafeBunWindows: config } });
+      await h.session();
+      await h.prompt('sidecar preserved core functionality', 'user-1');
+      assert.match(await h.tool('lcm_status'), new RegExp(`runtime_safety_backend=${backend}`));
+      assert.match(await h.tool('lcm_describe'), /sidecar preserved core functionality/);
+      const compaction = modelContext([]);
+      await h.hook('compaction', compaction);
+      assert.match(compaction.system[0].text, /LCM prototype resume note/);
+      await h.close();
+      assert.ok(h.aborted);
+      assert.ok(h.registrations.every((r) => r.disposed === 1));
     });
-  } finally {
-    // Plugin hooks keep their sidecar store open for the life of the plugin instance.
-    // Let the temp workspace be reclaimed by the OS after process exit.
-  }
+  });
+}
+
+test('V2 plugin exports setup and registers all LCM tools', async (t) => {
+  assert.equal(OpencodeLcmPlugin.id, 'opencode-lcm');
+  assert.equal(typeof OpencodeLcmPlugin.setup, 'function');
+  const h = await pluginHarness(t);
+  assert.deepEqual(
+    Object.keys(h.tools).sort(),
+    [
+      'lcm_artifact',
+      'lcm_blob_gc',
+      'lcm_blob_stats',
+      'lcm_compact',
+      'lcm_describe',
+      'lcm_doctor',
+      'lcm_expand',
+      'lcm_export_snapshot',
+      'lcm_grep',
+      'lcm_import_snapshot',
+      'lcm_lineage',
+      'lcm_pin_session',
+      'lcm_retrieval_debug',
+      'lcm_retention_report',
+      'lcm_retention_prune',
+      'lcm_resume',
+      'lcm_status',
+      'lcm_unpin_session',
+    ].sort(),
+  );
+  assert.match(
+    await h.tool('lcm_import_snapshot', { filePath: 'unused.json' }),
+    /mode is required/,
+  );
 });
 
-test('plugin routes Bun on Windows config override through the Node sidecar', async () => {
-  const workspace = makeWorkspace('lcm-plugin-bun-win-config-sidecar');
-
-  try {
-    await withSimulatedBunWindows(async () => {
-      const hooks = await OpencodeLcmPlugin(
-        makePluginContext(workspace),
-        makeOptions({ runtimeSafety: { allowUnsafeBunWindows: true }, freshTailMessages: 1 }),
-      );
-
-      assert.ok(hooks.tool.lcm_describe);
-      await hooks.event({
-        event: {
-          type: 'session.created',
-          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
-        },
-      });
-      await captureMessage(
-        { capture: (event) => hooks.event({ event }) },
-        {
-          sessionID: 's1',
-          messageID: 'm1',
-          created: 2,
-          parts: [textPart('s1', 'm1', 'm1-p', 'config-sidecar body')],
-        },
-      );
-
-      const toolContext = makeToolContext(workspace, 's1');
-      const status = await hooks.tool.lcm_status.execute({}, toolContext);
-      const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
-
-      assert.match(status, /schema_version=2/);
-      assert.match(status, /runtime_safety_allow_unsafe_bun_windows=false/);
-      assert.match(status, /runtime_safety_config_allow_unsafe_bun_windows=true/);
-      assert.match(status, /runtime_safety_env_allow_unsafe_bun_windows=false/);
-      assert.match(status, /runtime_safety_backend=node_sidecar/);
-      assert.match(describe, /config-sidecar body/);
-    });
-  } finally {
-    // Plugin hooks keep their sidecar store open for the life of the plugin instance.
-    // Let the temp workspace be reclaimed by the OS after process exit.
-  }
+test('context hook respects disabled system hint and keeps native messages below threshold', async (t) => {
+  const h = await pluginHarness(t, { systemHint: false });
+  const context = modelContext([textMessage('m1', 'unchanged')]);
+  const before = structuredClone(context);
+  await h.hook('context', context);
+  assert.deepEqual(context, before);
 });
 
-test('plugin allows explicit Bun on Windows env override', async () => {
-  const workspace = makeWorkspace('lcm-plugin-bun-win-override');
-
-  try {
-    await withSimulatedBunWindows(async () => {
-      process.env[ALLOW_UNSAFE_BUN_WINDOWS_ENV] = '1';
-
-      const hooks = await OpencodeLcmPlugin(
-        makePluginContext(workspace),
-        makeOptions({ freshTailMessages: 1 }),
-      );
-
-      assert.ok(hooks.tool.lcm_describe);
-
-      await hooks.event({
-        event: {
-          type: 'session.created',
-          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
-        },
-      });
-      await captureMessage(
-        { capture: (event) => hooks.event({ event }) },
-        {
-          sessionID: 's1',
-          messageID: 'm1',
-          created: 2,
-          parts: [textPart('s1', 'm1', 'm1-p', 'override-enabled body')],
-        },
-      );
-
-      const toolContext = makeToolContext(workspace, 's1');
-      const status = await hooks.tool.lcm_status.execute({}, toolContext);
-      const describe = await hooks.tool.lcm_describe.execute({ sessionID: 's1' }, toolContext);
-
-      assert.match(status, /schema_version=2/);
-      assert.match(status, /runtime_safety_allow_unsafe_bun_windows=true/);
-      assert.match(status, /runtime_safety_config_allow_unsafe_bun_windows=false/);
-      assert.match(status, /runtime_safety_env_allow_unsafe_bun_windows=true/);
-      assert.match(status, /runtime_safety_backend=in_process/);
-      assert.match(describe, /override-enabled body/);
-    });
-  } finally {
-    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
-    // Let the temp workspace be reclaimed by the OS after process exit.
-  }
-});
-
-test('plugin exposes tools, records events, and appends compaction context once', async () => {
-  const workspace = makeWorkspace('lcm-plugin');
-
-  try {
-    const hooks = await OpencodeLcmPlugin(
-      makePluginContext(workspace),
-      makeOptions({ freshTailMessages: 1 }),
-    );
-    const toolKeys = Object.keys(hooks.tool ?? {}).sort();
-
-    assert.deepEqual(
-      toolKeys,
-      [
-        'lcm_artifact',
-        'lcm_blob_gc',
-        'lcm_blob_stats',
-        'lcm_compact',
-        'lcm_describe',
-        'lcm_doctor',
-        'lcm_expand',
-        'lcm_export_snapshot',
-        'lcm_grep',
-        'lcm_import_snapshot',
-        'lcm_lineage',
-        'lcm_pin_session',
-        'lcm_retrieval_debug',
-        'lcm_retention_report',
-        'lcm_retention_prune',
-        'lcm_resume',
-        'lcm_status',
-        'lcm_unpin_session',
-      ].sort(),
-    );
-
-    await hooks.event({
-      event: {
-        type: 'session.created',
-        properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
-      },
-    });
-    await captureMessage(
-      { capture: (event) => hooks.event({ event }) },
-      {
-        sessionID: 's1',
-        messageID: 'm1',
-        created: 2,
-        parts: [textPart('s1', 'm1', 'm1-p', 'plugin hook body')],
-      },
-    );
-
-    const toolContext = makeToolContext(workspace, 's1');
-    const status = await hooks.tool.lcm_status.execute({}, toolContext);
-    const retrieval = await hooks.tool.lcm_retrieval_debug.execute({}, toolContext);
-    const describe = await hooks.tool.lcm_describe.execute({}, toolContext);
-    const doctor = await hooks.tool.lcm_doctor.execute({ sessionID: 's1' }, toolContext);
-    const grep = await hooks.tool.lcm_grep.execute({ query: 'plugin hook body' }, toolContext);
-    const importWithoutMode = await hooks.tool.lcm_import_snapshot.execute(
-      { filePath: 'unused.json' },
-      toolContext,
-    );
-    await hooks['experimental.chat.messages.transform']({}, { messages: null });
-    const failureStatus = await hooks.tool.lcm_status.execute({}, toolContext);
-
-    assert.match(status, /schema_version=2/);
-    assert.match(status, /session_count=1/);
-    assert.match(status, /db_bytes=\d+/);
-    assert.match(status, /prunable_events=0/);
-    assert.match(status, /message_fts=1/);
-    assert.match(status, /automatic_retrieval_scope_order=session,root,worktree/);
-    assert.match(status, /automatic_retrieval_scope_budgets=session:16,root:12,worktree:8,all:6/);
-    assert.match(status, /automatic_retrieval_stop_target_hits=3/);
-    assert.match(status, /automatic_retrieval_stop_on_first_scope_with_hits=false/);
-    assert.match(status, /recent_hook_failures=\d+/);
-    assert.match(retrieval, /status=no-debug-data/);
-    assert.match(describe, /Session: s1/);
-    assert.match(describe, /plugin hook body/);
-    assert.match(grep, /session=s1 node=/);
-    assert.match(importWithoutMode, /mode is required.*merge.*replace/);
-    assert.match(failureStatus, /op=chat\.messages\.transform/);
-    assert.match(doctor, /checked_scope=session:s1/);
-
-    const firstCompaction = { context: [], prompt: 'keep-default' };
-    await hooks['experimental.session.compacting']({ sessionID: 's1' }, firstCompaction);
-    assert.equal(firstCompaction.prompt, 'keep-default');
-    assert.equal(firstCompaction.context.length, 1);
-    assert.match(firstCompaction.context[0], /LCM prototype resume note/);
-
-    const dedupedCompaction = { context: [firstCompaction.context[0]], prompt: 'keep-default' };
-    await hooks['experimental.session.compacting']({ sessionID: 's1' }, dedupedCompaction);
-    assert.equal(dedupedCompaction.prompt, 'keep-default');
-    assert.equal(dedupedCompaction.context.length, 1);
-  } finally {
-    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
-    // Let the temp workspace be reclaimed by the OS after process exit.
-  }
-});
-
-test('plugin system and message transform hooks respect options', async () => {
-  const workspace = makeWorkspace('lcm-plugin-transform');
-
-  try {
-    const hooks = await OpencodeLcmPlugin(
-      makePluginContext(workspace),
-      makeOptions({ systemHint: false, freshTailMessages: 1, minMessagesForTransform: 3 }),
-    );
-
-    await hooks.event({
-      event: {
-        type: 'session.created',
-        properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
-      },
-    });
-
-    const systemOutput = { system: [] };
-    await hooks['experimental.chat.system.transform']({ sessionID: 's1', model: {} }, systemOutput);
-    assert.deepEqual(systemOutput.system, []);
-
-    const output = {
-      messages: [
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm1',
-          created: 1,
-          parts: [textPart('s1', 'm1', 'm1-p', 'first archived message')],
-        }),
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm2',
-          created: 2,
-          parts: [toolCompletedPart('s1', 'm2', 'm2-p', 'ctx_search', 'infrastructure output')],
-        }),
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm3',
-          created: 3,
-          parts: [textPart('s1', 'm3', 'm3-p', 'fresh user request')],
-        }),
-      ],
-    };
-
-    await hooks['experimental.chat.messages.transform']({}, output);
-    const retrieval = await hooks.tool.lcm_retrieval_debug.execute(
-      {},
-      makeToolContext(workspace, 's1'),
-    );
-
-    assert.match(output.messages[0].parts[0].text, /Archived by opencode-lcm/);
-    assert.match(output.messages[1].parts[0].state.output, /infrastructure tool output omitted/);
-    const summaryPart = output.messages[2].parts.find(
-      (part) => part.type === 'text' && part.metadata?.opencodeLcm === 'archive-summary',
-    );
-    assert.equal(output.messages[2].parts[0].text, 'fresh user request');
-    assert.ok(summaryPart);
-    assert.match(summaryPart.text, /Summary roots:/);
-    assert.ok(!summaryPart.text.includes('ctx_search'));
-    assert.match(retrieval, /status=no-hits/);
-    assert.match(retrieval, /stop_reason=scope-order-exhausted/);
-  } finally {
-    // Plugin hooks keep their SQLite store open for the life of the plugin instance.
-    // Let the temp workspace be reclaimed by the OS after process exit.
-  }
-});
-test('prompt hooks fail open when the store cannot open', async () => {
-  const workspace = makeWorkspace('lcm-plugin-fail-open');
-  const previousRuntime = process.env.OPENCODE_LCM_SQLITE_RUNTIME;
-  const previousLogger = getLogger();
-  const warnings = [];
-  const recordingLogger = {
-    debug() {},
-    info() {},
-    warn(message, context) {
-      warnings.push({ message, context });
-    },
-    error() {},
-  };
-
-  try {
-    process.env.OPENCODE_LCM_SQLITE_RUNTIME = 'bun';
-    setLogger(recordingLogger);
-
-    const hooks = await OpencodeLcmPlugin(makePluginContext(workspace), makeOptions());
-
-    await assert.doesNotReject(
-      hooks.event({
-        event: {
-          type: 'session.created',
-          properties: { sessionID: 's1', info: sessionInfo(workspace, 's1', 1) },
-        },
-      }),
-    );
-
-    const output = {
-      messages: [
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm1',
-          created: 1,
-          parts: [textPart('s1', 'm1', 'm1-p1', 'alpha message one')],
-        }),
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm2',
-          created: 2,
-          parts: [textPart('s1', 'm2', 'm2-p1', 'alpha message two')],
-        }),
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm3',
-          created: 3,
-          parts: [textPart('s1', 'm3', 'm3-p1', 'alpha message three')],
-        }),
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm4',
-          created: 4,
-          parts: [textPart('s1', 'm4', 'm4-p1', 'alpha message four')],
-        }),
-        conversationMessage({
-          sessionID: 's1',
-          messageID: 'm5',
-          created: 5,
-          parts: [textPart('s1', 'm5', 'm5-p1', 'alpha message five')],
-        }),
-      ],
-    };
-    const beforeMessages = structuredClone(output.messages);
-
-    await assert.doesNotReject(hooks['experimental.chat.messages.transform']({}, output));
-    assert.deepEqual(
-      output.messages,
-      beforeMessages,
-      'transform should leave messages unchanged on failure',
-    );
-
-    const compactOutput = { context: ['existing context'] };
-    const beforeContext = [...compactOutput.context];
-    await assert.doesNotReject(
-      hooks['experimental.session.compacting']({ sessionID: 's1' }, compactOutput),
-    );
-    assert.deepEqual(
-      compactOutput.context,
-      beforeContext,
-      'compacting context should remain unchanged on failure',
-    );
-
-    await assert.rejects(
-      hooks.tool.lcm_status.execute({}, makeToolContext(workspace, 's1')),
-      'user-invoked tools should continue to surface store failures',
-    );
-
-    assert.equal(warnings.length, 3, 'exactly three warnings should be recorded');
-    const operations = warnings.map((entry) => entry.context?.operation).sort();
-    assert.deepEqual(operations, [
-      'chat.messages.transform',
-      'event.capture',
-      'session.compacting',
-    ]);
-    for (const entry of warnings) {
-      assert.equal(entry.message, 'Optional LCM hook failed; continuing without archived context');
-      assert.ok(typeof entry.context?.operation === 'string');
-      assert.ok(typeof entry.context?.message === 'string');
+test('Bun Windows exposes disposable safe-mode status when Node cannot start', async (t) => {
+  await withSimulatedBunWindows(async () => {
+    const previous = process.env.OPENCODE_LCM_NODE_PATH;
+    const h = await pluginHarness(t, {}, { manualStart: true });
+    try {
+      process.env.OPENCODE_LCM_NODE_PATH = path.join(h.directory, 'missing-node.exe');
+      await h.start();
+      assert.deepEqual(Object.keys(h.tools), ['lcm_status']);
+      assert.match(await h.tool('lcm_status'), /reason=bun_windows_runtime_guard/);
+      await h.close();
+      assert.equal(h.registrations[0].disposed, 1);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_LCM_NODE_PATH;
+      else process.env.OPENCODE_LCM_NODE_PATH = previous;
     }
-  } finally {
-    if (previousRuntime === undefined) {
-      delete process.env.OPENCODE_LCM_SQLITE_RUNTIME;
-    } else {
-      process.env.OPENCODE_LCM_SQLITE_RUNTIME = previousRuntime;
-    }
-    setLogger(previousLogger);
-  }
+  });
 });
